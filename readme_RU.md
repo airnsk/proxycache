@@ -53,8 +53,9 @@
 2. **Установите зависимости** (программы, от которых зависит работа сервиса):
 
 ```bash
+git clone https://github.com/airnsk/proxycache.git
+cd proxycache
 python3 -m venv venv && source venv/bin/activate && pip install -r requirements.txt
-
 ```
 
 3. **Настройте параметры** (самое важное — указать адрес запущенного движка):
