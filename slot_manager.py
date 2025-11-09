@@ -1,18 +1,28 @@
 # slot_manager.py
 # -*- coding: utf-8 -*-
+
 """
-Менеджер слотов (SlotManager) — контролирует выбор и жизненный цикл KV‑кэша в слотах llama.cpp:
-- Активные «горячие» слоты используются только при достаточной похожести LCP (единый процентный порог).
-- Restore с диска — только если .meta проходит тот же порог, иначе холодный старт.
-- REJECT active‑lcp => отвергнутый hot‑слот исключается из кандидатов для назначения, чтобы не перетирать его кэш.
-- Параллелизм: каждый слот защищён asyncio.Lock, при полной занятости — ожидание LRU.
-- save/restore: работают только с basename имен файлов в каталоге --slot-save-path у llama.cpp.
+Менеджер слотов (SlotManager): глобально управляет KV-кэшами по всем бэкендам.
+
+Назначение:
+- Поддерживает стратегию выбора слота для «больших» запросов: active-exact → active-lcp (с порогом) → restore-lcp (с порогом) → cold.
+- Обеспечивает REJECT для недостаточно похожих hot слотов, чтобы не перетирать полезный кэш.
+- Реализует планировщик слотов для «малых» запросов: предпочитает свободный слот на «предпочитаемом» бэкенде,
+  затем любые свободные, затем холодные (hot=False), затем самые старые по LRU.
+- Сохраняет и восстанавливает KV-кэш через llama_client (basename = ключ префикса).
+- Ведёт глобальные привязки SlotBinding и LRU, защищает слоты per-slot asyncio.Lock.
+
+Глобальные идентификаторы:
+- Слот представлен парой (backend_id, local_slot_id) — единое пространство слотов над кластером.
+
+Логи:
+- На каждом этапе выводит key=value метрики: prefer_backend, slot_select (free/cold/oldest), ensure_* (источник, LCP, ratio),
+  cache_save/cache_restore и финальные события (release/mark_cold).
 """
 
-import os
 import time
-import httpx
 import asyncio
+import logging
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Optional, Set
 
@@ -23,328 +33,408 @@ from config import (
     DEFAULT_MODEL_ID,
     DISK_META_SCAN_LIMIT,
     PINNED_PREFIX_KEYS,
-    SLOT_SAVE_MOUNT,
     SIMILARITY_MIN_RATIO,
+    DEFAULT_WORDS_PER_BLOCK,
 )
-from hashing import scan_all_meta_local, lcp_blocks, write_meta_for_key_local  # блочная эвристика и локальные .meta [web:40]
+import hashing as hs
+
+log = logging.getLogger(__name__)
+
+# Глобальный тип слота: (backend_id, local_slot_id)
+GSlot = Tuple[int, int]
+
+@dataclass
+class Backend:
+    """
+    Описание одного бэкенда llama.cpp.
+
+    Поля:
+    - id: индекс бэкенда в конфигурации.
+    - url: адрес llama.cpp.
+    - slots: число локальных слотов на сервере.
+    - client: LlamaClient для этого бэкенда.
+    """
+    id: int
+    url: str
+    slots: int
+    client: LlamaClient
 
 @dataclass
 class SlotBinding:
     """
-    Описание состояния слота на стороне прокси (не у сервера):
-    - key: SHA256 канонического префикса (уникальный идентификатор префикса).
-    - prefix_text: канонический текст (для записи .meta и диагностики).
-    - block_hashes: цепочка SHA256 блоков (по словам) — для LCP‑сравнения без токенизации.
-    - last_use_ts: метка LRU (экранируем «самый старый» при эвикции/ожидании).
-    - words_per_block: размер блока слов для совместимости поиска.
-    - pinned: слот нельзя вытеснить.
-    - hot: слот содержит «пригодный» KV‑кэш (участвует в активном поиске).
-    - lock: асинхронная блокировка слота (обеспечивает ожидание при полной занятости).
+    Привязка глобального слота к ключу префикса и его параметрам.
+
+    Поля:
+    - backend_id, local_slot_id: идентификация слота.
+    - key: ключ префикса (SHA-256 канонического текста).
+    - prefix_text: канонический текст (для .meta).
+    - block_hashes: цепочка блок-хэшей для LCP.
+    - words_per_block: размер блока слов.
+    - hot: признак «горячего» слота (годен для reuse).
+    - last_used_ts: отметка времени для LRU-управления.
     """
+    backend_id: int
+    local_slot_id: int
     key: str
     prefix_text: str
     block_hashes: List[str]
-    last_use_ts: float
     words_per_block: int
-    pinned: bool = False
     hot: bool = True
-    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    last_used_ts: float = field(default_factory=lambda: time.time())
 
 class SlotManager:
     """
-    Основные задачи:
-    - ensure_slot_for_request: найти подходящий слот (active‑exact / active‑lcp / restore‑lcp / cold),
-      применяя единый порог похожести SIMILARITY_MIN_RATIO к lcp/min(len(req), len(candidate)).
-    - acquire_free_or_cold_slot: предпочтительно выбрать свободный id, затем cold, затем свободный hot,
-      иначе ждать LRU; опционально исключить «запрещённые» slot_id (например, отвергнутый hot).
-    - save_slot_cache/restore_slot_cache: обёртки над HTTP API сервера (/slots?action=save|restore), basename.
+    Глобальный менеджер слотов: хранит биндинги и локи, решает маршрутизацию и восстановление кэша.
     """
-    def __init__(self, slots_count: int, llama: LlamaClient, model_id: str = DEFAULT_MODEL_ID, logger=None):
-        self.slots_count = slots_count
-        self.llama = llama
-        self.model_id = model_id
-        self._bindings: Dict[int, SlotBinding] = {}
-        self._global_lock: Optional[asyncio.Lock] = None
-        self.log = logger
 
-    async def _lock_global(self) -> asyncio.Lock:
-        if self._global_lock is None:
-            self._global_lock = asyncio.Lock()
-        return self._global_lock
-
-    def _now(self) -> float:
-        return time.time()
-
-    def _eligible_active(self, b: SlotBinding, wpb: int) -> bool:
-        # Активный кандидат только если слот «горячий» и совпадает words_per_block
-        return b.hot and b.words_per_block == wpb  # [web:40]
-
-    def _free_slot_ids(self) -> List[int]:
-        # Свободные id (слоты без биндингов в прокси)
-        used = set(self._bindings.keys())
-        return [i for i in range(self.slots_count) if i not in used]
-
-    def _lrud_ids(self, exclude: Set[int]) -> List[int]:
-        # Идентификаторы занятых слотов по возрастанию last_use_ts (старые — первыми), за вычетом exclude
-        ids = [sid for sid in self._bindings.keys() if sid not in exclude]
-        return sorted(ids, key=lambda sid: self._bindings[sid].last_use_ts)
-
-    def choose_victim_slot(self, exclude: Set[int]) -> Optional[int]:
-        # LRU‑жертва среди неpinned и не исключённых слотов
-        victim_id = None
-        victim_ts = float("inf")
-        for sid, b in self._bindings.items():
-            if sid in exclude or b.pinned:
-                continue
-            if b.last_use_ts < victim_ts:
-                victim_id = sid
-                victim_ts = b.last_use_ts
-        return victim_id
-
-    def pick_cold_or_oldest_slot_for_small(self) -> Optional[int]:
-        # Для малых — сначала cold, иначе LRU
-        cold_id = None
-        cold_ts = float("inf")
-        for sid, b in self._bindings.items():
-            if b.pinned:
-                continue
-            if not b.hot and b.last_use_ts < cold_ts:
-                cold_id = sid
-                cold_ts = b.last_use_ts
-        if cold_id is not None:
-            return cold_id
-        return self.choose_victim_slot(exclude=set())
-
-    async def mark_slot_cold(self, slot_id: int) -> None:
-        b = self._bindings.get(slot_id)
-        if b:
-            b.hot = False
-
-    async def acquire_free_or_cold_slot(self, exclude: Optional[Set[int]] = None) -> Tuple[int, SlotBinding]:
+    def __init__(
+        self,
+        backends: List[Backend],
+        model_id: str = DEFAULT_MODEL_ID,
+        similarity_min_ratio: float = SIMILARITY_MIN_RATIO,
+        words_per_block_default: int = DEFAULT_WORDS_PER_BLOCK,
+    ):
         """
-        Универсальный захват слота (с lock) в порядке приоритета:
-        1) Свободный (небинденный) id, не в exclude — создаём Binding и берём lock.
-        2) Свободный cold (lock свободен), не в exclude — берём lock.
-        3) Свободный hot (lock свободен), не в exclude — берём lock.
-        4) Все заняты — ждём LRU вне exclude; если их нет — ждём LRU вообще.
+        Инициализация менеджера.
+
+        Аргументы:
+        - backends: список доступных бэкендов (url, slots, client).
+        - model_id: идентификатор модели (для .meta).
+        - similarity_min_ratio: порог похожести для LCP reuse/restore.
+        - words_per_block_default: размер блоков по умолчанию.
         """
-        ex = exclude or set()
+        self._backends: List[Backend] = backends
+        self._model_id = model_id
+        self._sim_ratio = similarity_min_ratio
+        self._wpb_default = words_per_block_default
 
-        # 1) Свободные id
-        free_ids = [sid for sid in self._free_slot_ids() if sid not in ex]
-        if free_ids:
-            sid = free_ids[0]
-            b = SlotBinding(key="(empty)", prefix_text="", block_hashes=[], last_use_ts=self._now(),
-                            words_per_block=16, pinned=False, hot=False)
-            self._bindings[sid] = b
-            await b.lock.acquire()
-            return sid, b
+        # Все возможные gslots (декартово произведение backend x slots)
+        self._all_slots: List[GSlot] = []
+        for be in backends:
+            for s in range(be.slots):
+                self._all_slots.append((be.id, s))
 
-        # 2) Свободные cold
-        for sid in self._lrud_ids(ex):
-            b = self._bindings[sid]
-            if b.pinned:
+        # Глобальные привязки и пер-слотовые замки
+        self._bindings: Dict[GSlot, SlotBinding] = {}
+        self._locks: Dict[GSlot, asyncio.Lock] = {g: asyncio.Lock() for g in self._all_slots}
+
+        # Для LRU
+        self._last_used: Dict[GSlot, float] = {}
+        log.info("slot_manager_init backends=%d total_slots=%d", len(backends), len(self._all_slots))
+
+    def _prefer_backend(self, req_key: str) -> int:
+        """
+        Простое распределение по хэшу ключа на id бэкенда (локальность).
+
+        Возвращает:
+        - backend_id для «предпочтительного» выбора.
+        """
+        h = int(req_key[:8], 16) if req_key and len(req_key) >= 8 else hash(req_key)
+        idx = abs(h) % len(self._backends)
+        log.debug("prefer_backend key=%s backend=%d", req_key[:16], idx)
+        return idx
+
+    def _slot_state(self, g: GSlot) -> str:
+        """
+        Человекочитаемое состояние слота: free/hot/cold.
+        """
+        b = self._bindings.get(g)
+        if b is None:
+            return "free"
+        return "hot" if b.hot else "cold"
+
+    def _free_slots_all(self, exclude: Set[GSlot]) -> List[GSlot]:
+        """
+        Список свободных gslot, исключая exclude.
+        """
+        out = []
+        for g in self._all_slots:
+            if g in exclude:
                 continue
-            if not b.hot and not b.lock.locked():
-                await b.lock.acquire()
-                return sid, b
+            if g not in self._bindings:
+                out.append(g)
+        return out
 
-        # 3) Свободные hot
-        for sid in self._lrud_ids(ex):
-            b = self._bindings[sid]
-            if b.pinned:
+    def _lrud_slots(self, exclude: Set[GSlot]) -> List[GSlot]:
+        """
+        Занятые gslot по возрастанию last_used_ts (LRU первым), исключая exclude.
+        """
+        pairs = []
+        for g, b in self._bindings.items():
+            if g in exclude:
                 continue
-            if not b.lock.locked():
-                await b.lock.acquire()
-                return sid, b
+            ts = self._last_used.get(g, b.last_used_ts)
+            pairs.append((ts, g))
+        pairs.sort(key=lambda x: x[0])
+        return [g for _, g in pairs]
 
-        # 4) Все заняты — ждём LRU вне exclude
-        lrud = self._lrud_ids(ex)
-        if lrud:
-            sid = lrud[0]
-            b = self._bindings[sid]
-            await b.lock.acquire()
-            return sid, b
+    def _backend(self, backend_id: int) -> Backend:
+        """
+        Получить описание бэкенда по id.
+        """
+        return self._backends[backend_id]
 
-        # 4b) Совсем без альтернатив — ждём «любой» LRU
-        all_ids = self._lrud_ids(exclude=set())
-        if not all_ids:
-            sid = 0
-            b = SlotBinding(key="(empty)", prefix_text="", block_hashes=[], last_use_ts=self._now(),
-                            words_per_block=16, pinned=False, hot=False)
-            self._bindings[sid] = b
-            await b.lock.acquire()
-            return sid, b
-        sid = all_ids[0]
-        b = self._bindings[sid]
-        await b.lock.acquire()
-        return sid, b
+    def _binding(self, g: GSlot) -> Optional[SlotBinding]:
+        """
+        Получить SlotBinding для gslot, если существует.
+        """
+        return self._bindings.get(g)
+
+    async def acquire_free_or_cold_slot(
+        self,
+        exclude: Optional[Set[GSlot]] = None,
+        prefer_backend_id: Optional[int] = None,
+    ) -> Tuple[GSlot, asyncio.Lock]:
+        """
+        Выбрать слот под запрос (для «малых» и для cold/restore «больших»).
+
+        Приоритет:
+        1) Свободный слот на предпочитаемом бэкенде.
+        2) Любой свободный слот.
+        3) «Холодный» занятый (hot=False) по LRU и не pinned.
+        4) Самый старый занятый по LRU (если не pinned).
+
+        Возвращает:
+        - (gslot, lock) — вызывающий обязан lock.acquire() перед использованием.
+        """
+        exclude = exclude or set()
+
+        # 1) Свободный на предпочитаемом
+        if prefer_backend_id is not None:
+            for g in self._all_slots:
+                if g in exclude:
+                    continue
+                if g[0] != prefer_backend_id:
+                    continue
+                if g not in self._bindings:
+                    log.info("slot_select be=%d slot=%d state=%s reason=free_preferred", g[0], g[1], self._slot_state(g))
+                    return g, self._locks[g]
+
+        # 2) Любой свободный
+        free_any = self._free_slots_all(exclude)
+        if free_any:
+            g = free_any[0]
+            log.info("slot_select be=%d slot=%d state=%s reason=free_any", g[0], g[1], self._slot_state(g))
+            return g, self._locks[g]
+
+        # 3) Холодный (LRU)
+        for g in self._lrud_slots(exclude):
+            b = self._bindings[g]
+            if not b.hot and b.key not in PINNED_PREFIX_KEYS:
+                log.info("slot_select be=%d slot=%d state=%s reason=cold_lru", g[0], g[1], self._slot_state(g))
+                return g, self._locks[g]
+
+        # 4) Старый занятый (если не pinned)
+        for g in self._lrud_slots(exclude):
+            b = self._bindings[g]
+            if b.key not in PINNED_PREFIX_KEYS:
+                log.info("slot_select be=%d slot=%d state=%s reason=oldest_lru", g[0], g[1], self._slot_state(g))
+                return g, self._locks[g]
+
+        lrud = self._lrud_slots(exclude)
+        if not lrud:
+            log.error("slot_select_failed reason=no_slots")
+            raise HTTPException(503, "No slots available")
+        g = lrud[0]
+        log.warning("slot_select be=%d slot=%d state=%s reason=wait_oldest_all_pinned", g[0], g[1], self._slot_state(g))
+        return g, self._locks[g]
+
+    def _best_active_exact(self, req_blocks: List[str]) -> Optional[Tuple[GSlot, SlotBinding]]:
+        """
+        Поиск точного совпадения среди hot привязок.
+        """
+        for g, b in self._bindings.items():
+            if b.hot and b.block_hashes == req_blocks:
+                return g, b
+        return None
+
+    def _best_active_lcp(self, req_blocks: List[str]) -> Optional[Tuple[GSlot, SlotBinding, int, float]]:
+        """
+        Поиск наилучшего LCP среди hot привязок.
+
+        Возвращает:
+        - (gslot, binding, lcp_count, ratio)
+        """
+        best = None
+        for g, b in self._bindings.items():
+            if not b.hot:
+                continue
+            l = hs.lcp_blocks(req_blocks, b.block_hashes)
+            denom = max(1, min(len(req_blocks), len(b.block_hashes)))
+            ratio = l / denom
+            if best is None or ratio > best[3]:
+                best = (g, b, l, ratio)
+        return best
+
+    def _best_restore_candidate(self, req_blocks: List[str], wpb: int) -> Optional[Tuple[str, int, float, List[str]]]:
+        """
+        Ищем лучший .meta кандидат по LCP.
+
+        Возвращает:
+        - (key, lcp, ratio, cand_blocks)
+        """
+        metas = hs.scan_all_meta_local(DISK_META_SCAN_LIMIT)
+        best = None
+        for m in metas:
+            if int(m.get("words_per_block") or wpb) != wpb:
+                continue
+            cand_blocks = m.get("block_hashes") or []
+            l = hs.lcp_blocks(req_blocks, cand_blocks)
+            denom = max(1, min(len(req_blocks), len(cand_blocks)))
+            ratio = l / denom
+            if best is None or ratio > best[2]:
+                best = (m.get("key"), l, ratio, cand_blocks)
+        return best
 
     async def ensure_slot_for_request(
         self,
         req_key: str,
-        req_prefix_text: str,
+        prefix_text: str,
         req_blocks: List[str],
-        words_per_block: int
-    ) -> Tuple[int, SlotBinding, str, int, int]:
+        words_per_block: int,
+    ) -> Tuple[GSlot, SlotBinding, str, int, int]:
         """
-        ЕДИНАЯ функция принятия решений:
-        - Active exact: принимаем всегда, если нашли. (Совпадение «все блоки»)
-        - Active LCP: доля lcp / min(len(req), len(slot)) >= SIMILARITY_MIN_RATIO? да — берём; нет — REJECT.
-          REJECT => запоминаем rejected_sid, чтобы не назначать туда cold/restore при наличии альтернатив.
-        - Restore LCP (.meta): доля lcp / min(len(req), len(meta)) >= SIMILARITY_MIN_RATIO? да — restore; нет — пропускаем.
-        - Если restore не подходит — cold start в слот, подобранный с учётом exclude.
-        Во всех случаях слот захватывается (lock) до завершения генерации.
+        Назначить слот для «большого» запроса по стратегии active/restore/cold.
+
+        Возвращает:
+        - (gslot, binding, source, lcp_count, binding_total)
+
+        Гарантии:
+        - Возвращаемый слот уже имеет захваченный lock; вызывающий обязан release в finally.
         """
-        gl = await self._lock_global()
-        async with gl:
-            best_sid = None
-            best_binding = None
-            best_lcp = 0
+        exclude: Set[GSlot] = set()
+        log.info("ensure_start key=%s req_blocks=%d wpb=%d bindings=%d", req_key[:16], len(req_blocks), words_per_block, len(self._bindings))
 
-            # 1) exact среди активных hot
-            for sid, b in self._bindings.items():
-                if not self._eligible_active(b, words_per_block):
-                    continue
-                if b.block_hashes == req_blocks:
-                    best_sid = sid
-                    best_binding = b
-                    best_lcp = len(req_blocks)
-                    break
+        # 1) exact среди hot
+        ex = self._best_active_exact(req_blocks)
+        if ex:
+            g, b = ex
+            lock = self._locks[g]
+            await lock.acquire()
+            self.touch(g)
+            log.info("ensure_pick source=active-exact be=%d slot=%d", g[0], g[1])
+            return g, b, "active-exact", len(req_blocks), len(self._bindings)
 
-            # 2) lcp среди активных hot
-            if best_sid is None:
-                for sid, b in self._bindings.items():
-                    if not self._eligible_active(b, words_per_block):
-                        continue
-                    l = lcp_blocks(req_blocks, b.block_hashes)
-                    if l > best_lcp:
-                        best_lcp = l
-                        best_sid = sid
-                        best_binding = b
+        # 2) active-lcp среди hot
+        lcp_best = self._best_active_lcp(req_blocks)
+        if lcp_best:
+            g, b, lcp_cnt, ratio = lcp_best
+            log.info("ensure_active_lcp be=%d slot=%d lcp=%d ratio=%.3f threshold=%.3f", g[0], g[1], lcp_cnt, ratio, self._sim_ratio)
+            if ratio >= self._sim_ratio:
+                lock = self._locks[g]
+                await lock.acquire()
+                self.touch(g)
+                log.info("ensure_pick source=active-lcp be=%d slot=%d", g[0], g[1])
+                return g, b, "active-lcp", lcp_cnt, len(self._bindings)
+            else:
+                exclude.add(g)
+                log.info("ensure_reject be=%d slot=%d reason=ratio_below", g[0], g[1])
 
-            rejected_sid: Optional[int] = None
-            if best_sid is not None and best_binding is not None:
-                if best_lcp == len(req_blocks):
-                    # Active exact — сразу берём
-                    if not best_binding.lock.locked():
-                        await best_binding.lock.acquire()
-                    best_binding.last_use_ts = self._now()
-                    if self.log:
-                        self.log.info(f"active-exact slot_id={best_sid} lcp_blocks={best_lcp}")
-                    return best_sid, best_binding, "active-exact", best_lcp, len(best_binding.block_hashes)
-                else:
-                    # Проверяем единый процентный порог
-                    denom = max(1, min(len(req_blocks), len(best_binding.block_hashes)))
-                    ratio = best_lcp / denom
-                    if ratio >= SIMILARITY_MIN_RATIO:
-                        if not best_binding.lock.locked():
-                            await best_binding.lock.acquire()
-                        best_binding.last_use_ts = self._now()
-                        if self.log:
-                            self.log.info(f"active-lcp ACCEPT slot_id={best_sid} lcp_blocks={best_lcp}/{denom} ratio={round(ratio,3)}")
-                        return best_sid, best_binding, "active-lcp", best_lcp, len(best_binding.block_hashes)
-                    else:
-                        rejected_sid = best_sid
-                        if self.log:
-                            self.log.info(f"active-lcp REJECT slot_id={best_sid} lcp_blocks={best_lcp}/{denom} ratio={round(ratio,3)} min_ratio={SIMILARITY_MIN_RATIO}")
+        # 3) restore-lcp по .meta
+        cand = self._best_restore_candidate(req_blocks, words_per_block)
+        if cand:
+            key2, lcp_cnt, ratio, cand_blocks = cand
+            log.info("ensure_restore_candidate key=%s lcp=%d ratio=%.3f threshold=%.3f", str(key2)[:16], lcp_cnt, ratio, self._sim_ratio)
+            if ratio >= self._sim_ratio:
+                prefer_be = self._prefer_backend(req_key)
+                g, lock = await self.acquire_free_or_cold_slot(exclude=exclude, prefer_backend_id=prefer_be)
+                await lock.acquire()
+                await self.restore_slot_cache(g, key2)
+                b = SlotBinding(
+                    backend_id=g[0],
+                    local_slot_id=g[1],
+                    key=req_key,
+                    prefix_text=prefix_text,
+                    block_hashes=req_blocks,
+                    words_per_block=words_per_block,
+                    hot=True,
+                )
+                self._bindings[g] = b
+                self.touch(g)
+                log.info("ensure_pick source=restore-lcp be=%d slot=%d restore_key=%s", g[0], g[1], str(key2)[:16])
+                return g, b, "restore-lcp", lcp_cnt, len(self._bindings)
 
-            # 3) Поиск restore‑кандидата среди .meta
-            best_meta = None
-            best_meta_lcp = 0
-            best_meta_blocks_total = 0
-            for meta in scan_all_meta_local(DISK_META_SCAN_LIMIT):
-                if meta.get("model_id") != self.model_id:
-                    continue
-                if int(meta.get("words_per_block", words_per_block)) != words_per_block:
-                    continue
-                mblocks = meta.get("blocks") or []
-                l = lcp_blocks(req_blocks, mblocks)
-                if l > best_meta_lcp:
-                    best_meta_lcp = l
-                    best_meta = meta
-                    best_meta_blocks_total = len(mblocks)
+        # 4) cold
+        prefer_be = self._prefer_backend(req_key)
+        g, lock = await self.acquire_free_or_cold_slot(exclude=exclude, prefer_backend_id=prefer_be)
+        await lock.acquire()
+        b = SlotBinding(
+            backend_id=g[0],
+            local_slot_id=g[1],
+            key=req_key,
+            prefix_text=prefix_text,
+            block_hashes=req_blocks,
+            words_per_block=words_per_block,
+            hot=True,
+        )
+        self._bindings[g] = b
+        self.touch(g)
+        log.info("ensure_pick source=cold be=%d slot=%d", g[0], g[1])
+        return g, b, "cold", 0, len(self._bindings)
 
-            # 4) Захват целевого слота с исключением отвергнутого hot
-            exclude = {rejected_sid} if rejected_sid is not None else set()
-            sid, slot_binding = await self.acquire_free_or_cold_slot(exclude=exclude)
+    async def save_slot_cache(self, g: GSlot, key: str) -> None:
+        """
+        Сохранить кэш слота на сервере и записать локальную .meta.
 
-            # 5) Restore, если .meta проходит порог
-            if best_meta and best_meta_lcp > 0:
-                denom = max(1, min(len(req_blocks), best_meta_blocks_total))
-                ratio = best_meta_lcp / denom
-                if ratio >= SIMILARITY_MIN_RATIO:
-                    meta_key = best_meta.get("key")
-                    await self.restore_slot_cache(sid, meta_key)
-                    binding = SlotBinding(
-                        key=meta_key,
-                        prefix_text="(from meta)",
-                        block_hashes=best_meta.get("blocks") or [],
-                        last_use_ts=self._now(),
-                        words_per_block=words_per_block,
-                        pinned=(meta_key in PINNED_PREFIX_KEYS),
-                        hot=True,
-                        lock=slot_binding.lock,
-                    )
-                    self._bindings[sid] = binding
-                    if self.log:
-                        self.log.info(f"restore-lcp ACCEPT slot_id={sid} lcp_blocks={best_meta_lcp}/{denom} ratio={round(ratio,3)}")
-                    return sid, binding, "restore-lcp", best_meta_lcp, len(binding.block_hashes)
-                else:
-                    if self.log:
-                        self.log.info(f"restore-lcp REJECT lcp_blocks={best_meta_lcp}/{denom} ratio={round(ratio,3)} min_ratio={SIMILARITY_MIN_RATIO}")
-
-            # 6) Холодный старт (не портим отвергнутый hot)
-            binding = SlotBinding(
-                key=req_key,
-                prefix_text=req_prefix_text,
-                block_hashes=req_blocks,
-                last_use_ts=self._now(),
-                words_per_block=words_per_block,
-                pinned=(req_key in PINNED_PREFIX_KEYS),
-                hot=True,
-                lock=slot_binding.lock,
+        Аргументы:
+        - g: глобальный слот (backend_id, slot_id).
+        - key: basename/ключ префикса (без пути).
+        """
+        be = self._backend(g[0])
+        log.info("cache_save be=%d slot=%d key=%s", g[0], g[1], key[:16])
+        await be.client.save_slot(g[1], basename=key)
+        b = self._bindings.get(g)
+        if b:
+            hs.write_meta_for_key_local(
+                key=key,
+                prefix_text=b.prefix_text,
+                model_id=self._model_id,
+                words_per_block=b.words_per_block,
+                block_hashes=b.block_hashes,
             )
-            self._bindings[sid] = binding
-            if self.log:
-                self.log.info(f"slot_bound_cold slot_id={sid} key={req_key}")
-            return sid, binding, "cold", 0, 0
 
-    async def save_slot_cache(self, slot_id: int, key: str) -> None:
+    async def restore_slot_cache(self, g: GSlot, key: str) -> None:
         """
-        Просит сервер сохранить KV‑состояние слота в файл slotcache_{key}.bin в каталоге --slot-save-path (basename). [web:6]
-        Пишет локальную .meta у прокси для будущего restore‑поиска. [web:40]
-        """
-        filename_basename = f"slotcache_{key}.bin"
-        try:
-            res = await self.llama.save_slot(slot_id, filename_basename)
-            if self.log:
-                self.log.info(f"slot_saved slot_id={slot_id} key={key} filename={filename_basename} meta={res}")
-            b = self._bindings.get(slot_id)
-            if b:
-                write_meta_for_key_local(key, b.prefix_text, model_id=self.model_id,
-                                         words_per_block=b.words_per_block,
-                                         block_hashes=b.block_hashes)
-        except httpx.HTTPStatusError as e:
-            if self.log:
-                self.log.warning(f"slot_save_failed slot_id={slot_id} key={key} filename={filename_basename} status={e.response.status_code}")
+        Восстановить кэш слота с сервера по basename = key.
 
-    async def restore_slot_cache(self, slot_id: int, key: str) -> None:
+        Аргументы:
+        - g: глобальный слот.
+        - key: basename/ключ префикса.
         """
-        Просит сервер восстановить KV‑состояние слота из файла slotcache_{key}.bin (basename) внутри --slot-save-path. [web:6]
-        """
-        filename_basename = f"slotcache_{key}.bin"
-        try:
-            res = await self.llama.restore_slot(slot_id, filename_basename)
-            if self.log:
-                self.log.info(f"slot_restored slot_id={slot_id} key={key} filename={filename_basename} meta={res}")
-        except httpx.HTTPStatusError as e:
-            if self.log:
-                self.log.warning(f"slot_restore_failed slot_id={slot_id} key={key} filename={filename_basename} status={e.response.status_code}")
+        be = self._backend(g[0])
+        log.info("cache_restore be=%d slot=%d key=%s", g[0], g[1], key[:16])
+        await be.client.restore_slot(g[1], basename=key)
 
-    async def touch(self, slot_id: int) -> None:
+    def touch(self, g: GSlot) -> None:
         """
-        Обновляет last_use_ts слота — для LRU‑эвикции и диагностики.
+        Обновить метку времени LRU для gslot (важно во время длительного stream).
         """
-        if slot_id in self._bindings:
-            self._bindings[slot_id].last_use_ts = time.time()
+        ts = time.time()
+        self._last_used[g] = ts
+        b = self._bindings.get(g)
+        if b:
+            b.last_used_ts = ts
+
+    def release(self, g: GSlot) -> None:
+        """
+        Освободить lock слота (безопасно).
+        """
+        lock = self._locks[g]
+        if lock.locked():
+            lock.release()
+            log.debug("slot_release be=%d slot=%d", g[0], g[1])
+
+    def mark_slot_cold(self, g: GSlot) -> None:
+        """
+        Пометить занятый слот как cold (hot=False), пригоден для «малых» или эвикции.
+        """
+        b = self._bindings.get(g)
+        if b and b.hot:
+            b.hot = False
+            log.info("slot_mark_cold be=%d slot=%d key=%s", g[0], g[1], b.key[:16])
+
+    def get_binding(self, g: GSlot) -> Optional[SlotBinding]:
+        """
+        Вернуть SlotBinding для gslot, если существует.
+        """
+        return self._bindings.get(g)
