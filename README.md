@@ -1,5 +1,8 @@
+<img width="2848" height="1600" alt="image_" src="https://github.com/user-attachments/assets/1c577352-6746-40b9-b778-ff85ade9f55a" />
+
 
 ### What this service is
+
 
 This service is a smart proxy in front of llama.cpp that makes long‑context chat and IDE workflows much faster by managing llama.cpp slots, reusing cached context, and restoring saved caches from disk when needed. It speaks an OpenAI‑compatible Chat Completions API, so existing clients can connect without changes, including both streaming (SSE) and non‑stream responses depending on request settings.
 
@@ -38,7 +41,7 @@ python3 proxycache.py  # or: uvicorn app:app --host 0.0.0.0 --port 8081
 
 Your clients should call the proxy’s /v1/chat/completions endpoint; the proxy will handle similarity, slot selection, save/restore, and streaming vs non‑streaming automatically.
 
-### Plain‑English parameters
+### Parameters
 
 - LLAMA_SERVER_URL: The llama.cpp server base URL, e.g., http://127.0.0.1:8080, which must expose the OpenAI‑compatible chat completions endpoint.
 - SLOTS_COUNT: The number of server slots (should match llama.cpp -np) so the proxy can track and plan reuse/restore correctly under load.
