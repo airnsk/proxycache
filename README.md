@@ -36,6 +36,8 @@ This enables the OpenAI‑compatible HTTP server, a pool of 4 slots, and a direc
 
 2) Run the proxy next to it:
 ```bash
+git clone https://github.com/airnsk/proxycache.git
+cd proxycache
 python3 -m venv venv && source venv/bin/activate && pip install -r requirements.txt
 python3 proxycache.py  # or: uvicorn app:app --host 0.0.0.0 --port 8081
 ```
