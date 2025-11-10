@@ -1,110 +1,94 @@
 # llama_client.py
 # -*- coding: utf-8 -*-
-import os
-from typing import Dict, AsyncIterator, Tuple, Optional
+
+"""
+HTTP-клиент к llama.cpp: /v1/chat/completions (stream/non-stream), /slots save/restore.
+- stream: build_request+send(stream=True), сырые байты.
+- non-stream: строгий JSON парсинг + fallback, если content-type не JSON.
+- /slots: filename в JSON-теле (во избежание 500 parse error).
+- Пин слота дублируется в root/options/query.
+"""
 
 import httpx
+import logging
+from typing import Dict, Optional, Tuple
 
-from config import LLAMA_SERVER_URL, REQUEST_TIMEOUT  # базовая конфигурация
+from config import REQUEST_TIMEOUT
+
+log = logging.getLogger(__name__)
 
 class LlamaClient:
-    """
-    HTTP-клиент к llama.cpp server с поддержкой:
-      - /slots (статус)
-      - /slots/{id}?action=save|restore (KV-слоты; filename = basename)
-      - /v1/chat/completions (stream=false JSON, stream=true SSE)
-    Особенности:
-      - При наличии _slot_id в body он будет продублирован как slot_id/id_slot на корневом уровне,
-        добавлен в options.slot_id/options.id_slot и продублирован в query (?slot_id=...&id_slot=...).
-      - Это повышает вероятность, что конкретная серверная сборка действительно закрепит запрос в нужный слот.
-    """
-
-    def __init__(self, base_url: str = LLAMA_SERVER_URL):
+    def __init__(self, base_url: str):
+        self.base_url = base_url.rstrip("/")
         limits = httpx.Limits(max_keepalive_connections=20, max_connections=100)
-        self._client = httpx.AsyncClient(
-            base_url=base_url,
-            timeout=httpx.Timeout(REQUEST_TIMEOUT),
+        self.client = httpx.AsyncClient(
+            base_url=self.base_url,
+            timeout=REQUEST_TIMEOUT,
             limits=limits,
-        )  # корректный способ создать HTTP клиент для FastAPI-приложения
+        )
+        log.info("client_init url=%s httpx_version=%s", base_url, httpx.__version__)
 
     async def close(self):
-        await self._client.aclose()  # корректное закрытие клиента по завершении приложения
+        await self.client.aclose()
 
-    async def slots_status(self) -> Dict:
-        r = await self._client.get("/slots")
-        r.raise_for_status()
-        return r.json()  # llama.cpp server предоставляет статус слотов по /slots
+    @staticmethod
+    def _with_slot_id(body: Dict, slot_id: Optional[int]) -> Tuple[Dict, Dict]:
+        if slot_id is None:
+            return body, {}
+        new_body = dict(body)
+        # root
+        new_body["_slot_id"] = slot_id
+        new_body["slot_id"] = slot_id
+        new_body["id_slot"] = slot_id
+        # options
+        opts = dict(new_body.get("options") or {})
+        opts["slot_id"] = slot_id
+        opts["id_slot"] = slot_id
+        new_body["options"] = opts
+        # query
+        query = {"slot_id": slot_id, "id_slot": slot_id}
+        return new_body, query
 
-    async def save_slot(self, slot_id: int, filename_basename: str) -> Dict:
-        """
-        Сохранение KV-слота в файле с именем filename_basename внутри каталога --slot-save-path (на стороне сервера).
-        Важно: filename должен быть только basename, без абсолютных путей.
-        """
-        params = {"action": "save"}
-        data = {"filename": os.path.basename(filename_basename)}
-        r = await self._client.post(f"/slots/{slot_id}", params=params, json=data)
-        r.raise_for_status()
-        return r.json() if r.content else {}  # filename = basename для --slot-save-path
+    async def chat_completions(self, body: Dict, slot_id: Optional[int] = None, stream: bool = False):
+        body2, query = self._with_slot_id(body, slot_id)
+        if stream:
+            req = self.client.build_request("POST", "/v1/chat/completions", json=body2, params=query)
+            resp = await self.client.send(req, stream=True)
+            return resp
+        resp = await self.client.post("/v1/chat/completions", json=body2, params=query)
+        resp.raise_for_status()
+        ctype = resp.headers.get("content-type", "")
+        if "application/json" not in ctype:
+            raw = resp.text or ""
+            log.error("non_stream_non_json content_type=%s raw_len=%d", ctype, len(raw))
+            return {"object": "error", "message": "provider returned non-JSON", "raw": raw[:2048]}
+        try:
+            return resp.json()
+        except Exception as e:
+            raw = resp.text or ""
+            log.error("non_stream_json_parse_error status=%d raw_len=%d err=%s", resp.status_code, len(raw), e)
+            return {"object": "error", "message": "invalid json from provider", "raw": raw[:2048]}
 
-    async def restore_slot(self, slot_id: int, filename_basename: str) -> Dict:
-        """
-        Восстановление KV-слота из файла filename_basename внутри каталога --slot-save-path (на стороне сервера).
-        """
-        params = {"action": "restore"}
-        data = {"filename": os.path.basename(filename_basename)}
-        r = await self._client.post(f"/slots/{slot_id}", params=params, json=data)
-        r.raise_for_status()
-        return r.json() if r.content else {}  # сервер сам читает файл из --slot-save-path
+    async def save_slot(self, slot_id: int, basename: str) -> bool:
+        # JSON body: {"filename": "..."} — иначе 500 на некоторых сборках
+        resp = await self.client.post(
+            f"/slots/{slot_id}",
+            params={"action": "save"},
+            json={"filename": basename},
+        )
+        if resp.status_code == 500:
+            log.warning("save_slot_500 slot=%d basename=%s", slot_id, basename[:16])
+            return False
+        resp.raise_for_status()
+        return True
 
-    def _inject_slot(self, body: Dict) -> Tuple[Dict, Optional[int], str]:
-        """
-        Если в body присутствует _slot_id, продублировать его:
-          - в корне: slot_id, id_slot
-          - в options: slot_id, id_slot
-          - вернуть также query-строку с теми же параметрами для совместимости (?slot_id=...&id_slot=...)
-        """
-        b = dict(body)
-        slot_id = b.pop("_slot_id", None)
-        query_suffix = ""
-        if slot_id is not None:
-            # Дублируем в корне
-            b["slot_id"] = slot_id
-            b["id_slot"] = slot_id
-            # Дублируем в options
-            opts = dict(b.get("options") or {})
-            opts["slot_id"] = slot_id
-            opts["id_slot"] = slot_id
-            b["options"] = opts
-            # Query-параметры для некоторых ревизий сервера
-            query_suffix = f"?slot_id={slot_id}&id_slot={slot_id}"
-        return b, slot_id, query_suffix
-
-    async def chat_completions_stream(self, body: Dict) -> AsyncIterator[bytes]:
-        """
-        stream=true — проксирование SSE чанков как есть (text/event-stream).
-        При наличии _slot_id — пробрасываем slot во всех формах (root/options/query).
-        """
-        b, slot_id, q = self._inject_slot(body)
-        # Убедимся, что stream=true не потерялся
-        b["stream"] = True
-        # cache_prompt должен управляться вызывающей стороной, но если нужно:
-        # b.setdefault("cache_prompt", True)
-
-        url = "/v1/chat/completions" + (q if q else "")
-        async with self._client.stream("POST", url, json=b) as r:
-            r.raise_for_status()
-            async for chunk in r.aiter_raw():
-                if chunk:
-                    yield chunk  # отдаём сырые data: {...}\n\n чанки для совместимости с клиентами OpenAI
-
-    async def chat_completions_json(self, body: Dict) -> Dict:
-        """
-        stream=false — вернуть цельный JSON-ответ единожды без SSE.
-        При наличии _slot_id — пробрасываем slot во всех формах (root/options/query).
-        """
-        b, slot_id, q = self._inject_slot(body)
-        b["stream"] = False
-        url = "/v1/chat/completions" + (q if q else "")
-        r = await self._client.post(url, json=b)
-        r.raise_for_status()
-        return r.json()  # обычный JSON-ответ как в OpenAI Chat Completions
+    async def restore_slot(self, slot_id: int, basename: str) -> bool:
+        resp = await self.client.post(
+            f"/slots/{slot_id}",
+            params={"action": "restore"},
+            json={"filename": basename},
+        )
+        if resp.status_code != 200:
+            log.warning("restore_slot_status=%d slot=%d basename=%s", resp.status_code, slot_id, basename[:16])
+            return False
+        return True
