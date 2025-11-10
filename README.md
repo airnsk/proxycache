@@ -29,7 +29,7 @@ llama.cpp’s HTTP server exposes slot save/restore; saving writes a cache file 
 
 1) Start llama.cpp ( https://github.com/ggml-org/llama.cpp ) with slots and a cache directory:
 ```bash
-llama-server -m ./model.gguf -np 4 --slot-save-path /var/kvcache --host 0.0.0.0 --port 8080
+llama-server -m ./model.gguf -np 4 --slot-save-path /var/kvcache --host 0.0.0.0 --port 8080 --swa-full
 ```
 
 This enables the OpenAI‑compatible HTTP server, a pool of 4 slots, and a directory where slot KV caches are saved and restored by basename.
