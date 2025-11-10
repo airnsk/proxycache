@@ -12,12 +12,17 @@
 - Сохраняет и восстанавливает KV-кэш через llama_client (basename = ключ префикса).
 - Ведёт глобальные привязки SlotBinding и LRU, защищает слоты per-slot asyncio.Lock.
 
+ВАЖНО (фикс проблемы эвикции):
+- При выборе занятого слота под restore или cold старт (эвикция) теперь перед перезаписью выполняется server-side save
+  текущего содержимого слота (basename = старый key) и запись локальной .meta у прокси; затем старый binding снимается.
+  Это гарантирует, что kvslots_meta/LOCAL_META_DIR будет заполнен и restore-lcp в будущем найдёт кандидата.
+
 Глобальные идентификаторы:
 - Слот представлен парой (backend_id, local_slot_id) — единое пространство слотов над кластером.
 
 Логи:
 - На каждом этапе выводит key=value метрики: prefer_backend, slot_select (free/cold/oldest), ensure_* (источник, LCP, ratio),
-  cache_save/cache_restore и финальные события (release/mark_cold).
+  cache_save/cache_restore и финальные события (release/mark_cold/evict_*).
 """
 
 import time
@@ -93,6 +98,7 @@ class SlotManager:
         model_id: str = DEFAULT_MODEL_ID,
         similarity_min_ratio: float = SIMILARITY_MIN_RATIO,
         words_per_block_default: int = DEFAULT_WORDS_PER_BLOCK,
+        evict_save_enabled: bool = True,  # включить сохранение при эвикции (фикс kvslots_meta)
     ):
         """
         Инициализация менеджера.
@@ -102,11 +108,13 @@ class SlotManager:
         - model_id: идентификатор модели (для .meta).
         - similarity_min_ratio: порог похожести для LCP reuse/restore.
         - words_per_block_default: размер блоков по умолчанию.
+        - evict_save_enabled: если True — перед перезаписью занятого слота выполняется save+запись .meta.
         """
         self._backends: List[Backend] = backends
         self._model_id = model_id
         self._sim_ratio = similarity_min_ratio
         self._wpb_default = words_per_block_default
+        self._evict_save_enabled = bool(evict_save_enabled)
 
         # Все возможные gslots (декартово произведение backend x slots)
         self._all_slots: List[GSlot] = []
@@ -120,7 +128,7 @@ class SlotManager:
 
         # Для LRU
         self._last_used: Dict[GSlot, float] = {}
-        log.info("slot_manager_init backends=%d total_slots=%d", len(backends), len(self._all_slots))
+        log.info("slot_manager_init backends=%d total_slots=%d evict_save=%s", len(backends), len(self._all_slots), self._evict_save_enabled)
 
     def _prefer_backend(self, req_key: str) -> int:
         """
@@ -179,6 +187,34 @@ class SlotManager:
         Получить SlotBinding для gslot, если существует.
         """
         return self._bindings.get(g)
+
+    async def _evict_if_needed(self, g: GSlot) -> None:
+        """
+        Эвикция перед повторным использованием занятого слота:
+        - если binding существует и не pinned — опционально выполняется save_slot_cache (server-side save + локальная .meta),
+          затем binding снимается из пула (del), чтобы не держать устаревшую ссылку.
+        - если binding отсутствует — ничего не делаем.
+
+        Требование:
+        - Вызывать ТОЛЬКО под захваченным lock соответствующего gslot.
+        """
+        b = self._bindings.get(g)
+        if not b:
+            return
+        if b.key in PINNED_PREFIX_KEYS:
+            # По логике выбора мы не должны сюда попасть, но на всякий случай не трогаем pinned.
+            log.warning("evict_skip_pinned be=%d slot=%d key=%s", g[0], g[1], b.key[:16])
+            return
+        if self._evict_save_enabled:
+            log.info("evict_save be=%d slot=%d key=%s", g[0], g[1], b.key[:16])
+            # save_slot_cache сам запишет .meta на основе текущего binding'а
+            await self.save_slot_cache(g, b.key)
+            log.info("evict_saved be=%d slot=%d key=%s", g[0], g[1], b.key[:16])
+        else:
+            log.info("evict_drop be=%d slot=%d key=%s", g[0], g[1], b.key[:16])
+        # Снимаем binding: содержимое слота дальше будет перезаписано
+        if g in self._bindings:
+            del self._bindings[g]
 
     async def acquire_free_or_cold_slot(
         self,
@@ -339,7 +375,11 @@ class SlotManager:
                 prefer_be = self._prefer_backend(req_key)
                 g, lock = await self.acquire_free_or_cold_slot(exclude=exclude, prefer_backend_id=prefer_be)
                 await lock.acquire()
+                # ФИКС: перед restore сохраняем и снимаем существующий binding (эвикция)
+                await self._evict_if_needed(g)
+                # выполняем restore (basename=candidate key)
                 await self.restore_slot_cache(g, key2)
+                # регистрируем новый hot binding под текущий req_key
                 b = SlotBinding(
                     backend_id=g[0],
                     local_slot_id=g[1],
@@ -358,6 +398,8 @@ class SlotManager:
         prefer_be = self._prefer_backend(req_key)
         g, lock = await self.acquire_free_or_cold_slot(exclude=exclude, prefer_backend_id=prefer_be)
         await lock.acquire()
+        # ФИКС: перед созданием нового binding сохраняем/снимаем старый (если был)
+        await self._evict_if_needed(g)
         b = SlotBinding(
             backend_id=g[0],
             local_slot_id=g[1],
@@ -384,6 +426,7 @@ class SlotManager:
         log.info("cache_save be=%d slot=%d key=%s", g[0], g[1], key[:16])
         await be.client.save_slot(g[1], basename=key)
         b = self._bindings.get(g)
+        # Пишем .meta по текущему binding'у, если он ещё есть (при эвикции мы вызываем save до удаления binding'а)
         if b:
             hs.write_meta_for_key_local(
                 key=key,
