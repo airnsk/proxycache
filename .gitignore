@@ -1,1 +1,3 @@
 kv_meta/
+venv/
+__pycache__/
